@@ -1,0 +1,55 @@
+[project]
+name = "pyobs-zwohid"
+version = "2.0.0b1"
+description = "pyobs modules for ZWO USB HID astronomy hardware (EFW filter wheels and EAF focusers)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Maksim Semenov", email = "ms6107@gmail.com" }]
+dependencies = [
+    "pyobs-core>=2.14.0,<3",
+    "pyzwohid>=0.2.1,<1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14.0",
+    "ruff>=0.9.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyobs_zwohid"]
+
+[tool.uv.sources]
+pyobs-core = { path = "../pyobs-core", editable = true }
+pyzwohid = { path = "../pyzwo", editable = true }
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["astropy.*", "astroplan.*", "pytz.*", "py_expression_eval.*", "slixmpp.*", "single_source.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pyobs.*"]
+follow_imports = "silent"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "G"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
