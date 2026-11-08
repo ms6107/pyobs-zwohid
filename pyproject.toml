@@ -9,7 +9,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Maksim Semenov", email = "ms6107@gmail.com" }]
 dependencies = [
     "pyobs-core>=2.14.0,<3",
-    "pyzwohid>=0.2.1,<1",
+    "pyzwohid>=0.2.2,<1",
 ]
 
 [project.urls]
