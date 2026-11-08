@@ -355,21 +355,34 @@ async def test_set_focus_and_offset_error_paths() -> None:
         await eaf.set_focus_offset(50.0)
     assert eaf.comm.get_own_state(IFocuser).focus_offset == pytest.approx(0.0)
 
-    # 3. Device already moving -> DeviceBusyError (state stays SLEWING)
+    # 3. Device already moving -> DeviceBusyError (state stays SLEWING, focus_offset unchanged)
     dev.eaf_status = _eaf_status(moving=True, step=20_000)
     with pytest.raises(exc.DeviceBusyError, match="EAF is already moving"):
         await eaf.set_focus(25.0)
     assert eaf.motion_status() == MotionStatus.SLEWING
     with pytest.raises(exc.DeviceBusyError, match="EAF is already moving"):
         await eaf.set_focus_offset(1.0)
+    assert eaf.comm.get_own_state(IFocuser).focus_offset == pytest.approx(0.0)
     dev.eaf_status = _eaf_status(moving=False, step=20_000)
 
-    # 4. Incomplete move (torque stall) -> ERROR + MoveError + updated FocuserState
+    # 3b. Device becomes busy between set_focus_offset status check and move() -> focus_offset stays 0.0
+    dev.move_error = ZwoBusyError("EAF became busy before move()")
+    with pytest.raises(exc.DeviceBusyError, match="EAF became busy before move\\(\\)"):
+        await eaf.set_focus_offset(2.5)
+    assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(20.0)
+    assert eaf.comm.get_own_state(IFocuser).focus_offset == pytest.approx(0.0)
+    dev.move_error = None
+
+    # 4. Incomplete move (torque stall) -> ERROR + MoveError + updated FocuserState (focus_offset unchanged)
     dev.settled_step_override = 22_100
     with pytest.raises(exc.MoveError, match="settled at step 22100 instead of target step 30000"):
         await eaf.set_focus(30.0)
     assert eaf.motion_status() == MotionStatus.ERROR
     assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(22.1)
+    with pytest.raises(exc.MoveError, match="settled at step 22100 instead of target step 23100"):
+        await eaf.set_focus_offset(1.0)
+    assert eaf.motion_status() == MotionStatus.ERROR
+    assert eaf.comm.get_own_state(IFocuser).focus_offset == pytest.approx(0.0)
     dev.settled_step_override = None
 
     # 5. ZwoError / TimeoutError during move or status query -> ERROR + MoveError
@@ -408,14 +421,30 @@ async def test_background_poll_updates_temperature_and_position() -> None:
     assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(12.345)
     assert eaf.comm.get_own_state(ITemperatures).readings == [SensorReading(name="Focus", value=18.75)]
 
-    # Simulate hand-controller button release and transient status error survival
-    dev.status_error = ZwoError("Transient read glitch")
-    await asyncio.sleep(0.02)
-    dev.status_error = None
+    # Simulate hand-controller button release
     dev.eaf_status = _eaf_status(moving=False, step=15_000, temperature_c=18.5)
     await asyncio.sleep(0.03)
     assert eaf.motion_status() == MotionStatus.POSITIONED
     assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(15.0)
     assert eaf.comm.get_own_state(ITemperatures).readings == [SensorReading(name="Focus", value=18.5)]
+
+    # Failed status poll transitions motion status to ERROR (and IReady to False)
+    dev.status_error = ZwoError("Disconnected during background poll")
+    await asyncio.sleep(0.03)
+    assert eaf.motion_status() == MotionStatus.ERROR
+    assert eaf.comm.get_own_state(IReady).ready is False
+
+    # Subsequent settled status poll updates position/temperature but preserves ERROR until reset_error()
+    dev.status_error = None
+    dev.eaf_status = _eaf_status(moving=False, step=16_000, temperature_c=18.25)
+    await asyncio.sleep(0.03)
+    assert eaf.motion_status() == MotionStatus.ERROR
+    assert eaf.comm.get_own_state(IReady).ready is False
+    assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(16.0)
+    assert eaf.comm.get_own_state(ITemperatures).readings == [SensorReading(name="Focus", value=18.25)]
+
+    assert await eaf.reset_error() is True
+    assert eaf.motion_status() == MotionStatus.POSITIONED
+    assert eaf.comm.get_own_state(IReady).ready is True
 
     await eaf.close()

@@ -33,6 +33,7 @@ class FakeEfwDevice(FakeZwoHidDevice, Efw):
         self.pending_statuses: list[EfwStatus] = list(self.initial_statuses)
         self.move_to_slot_calls: list[tuple[int, bool, float]] = []
         self.move_to_slot_error: Exception | None = None
+        self.settled_slot_override: int | None = None
         self.calibrate_calls: list[float] = []
         self.calibrate_error: Exception | None = None
 
@@ -65,8 +66,9 @@ class FakeEfwDevice(FakeZwoHidDevice, Efw):
             raise ZwoBusyError("EFW is already moving")
         if self.move_to_slot_error is not None:
             raise self.move_to_slot_error
-        self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=slot)
-        return slot
+        settled = slot if self.settled_slot_override is None else self.settled_slot_override
+        self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=settled)
+        return settled
 
     async def calibrate(self, timeout: float = 60.0) -> int:
         self.calibrate_calls.append(timeout)
@@ -74,8 +76,9 @@ class FakeEfwDevice(FakeZwoHidDevice, Efw):
             raise ZwoBusyError("EFW is already moving")
         if self.calibrate_error is not None:
             raise self.calibrate_error
-        self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=1)
-        return 1
+        settled = 1 if self.settled_slot_override is None else self.settled_slot_override
+        self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=settled)
+        return settled
 
 
 class _TestableZwoEfw(ZwoEfw):
@@ -218,7 +221,8 @@ async def test_set_filter_error_paths() -> None:
     FakeEfwDevice.reset_efw_fakes(
         initial_statuses=[EfwStatus(moving=False, slot_count=5, slot=1)],
     )
-    efw = _TestableZwoEfw(filters=["L", "R", "G", "B", "Ha"])
+    comm = FakeComm()
+    efw = _TestableZwoEfw(filters=["L", "R", "G", "B", "Ha"], comm=comm)
     await efw.open()
     dev = FakeEfwDevice.instances[0]
 
@@ -233,7 +237,17 @@ async def test_set_filter_error_paths() -> None:
     assert efw.motion_status() == MotionStatus.SLEWING
     dev.efw_status = EfwStatus(moving=False, slot_count=5, slot=1)
 
-    # 3. ZwoError / TimeoutError from underlying controller -> ERROR + MoveError
+    # 3. Wrong settled slot -> updates FilterState to actual slot, sets ERROR, raises MoveError
+    comm.events.clear()
+    dev.settled_slot_override = 2
+    with pytest.raises(exc.MoveError, match="settled at slot 2 \\('R'\\) instead of target slot 4 \\('B'\\)"):
+        await efw.set_filter("B")
+    assert efw.comm.get_own_state(IFilters).filter == "R"
+    assert efw.motion_status() == MotionStatus.ERROR
+    assert [e for e in comm.events if isinstance(e, FilterChangedEvent)] == []
+    dev.settled_slot_override = None
+
+    # 4. ZwoError / TimeoutError from underlying controller -> ERROR + MoveError
     for raw_err in (
         ZwoError(f"EFW hardware error on {DEV_PATH}"),
         TimeoutError("move_to_slot(4) timed out after 30.00s"),
@@ -276,6 +290,14 @@ async def test_calibrate_homes_wheel_to_slot_one_and_handles_errors() -> None:
         await efw.calibrate()
     assert efw.motion_status() == MotionStatus.SLEWING
     dev.efw_status = EfwStatus(moving=False, slot_count=5, slot=1)
+
+    # Wrong settled slot during calibrate -> updates FilterState, sets ERROR, raises MoveError
+    dev.settled_slot_override = 3
+    with pytest.raises(exc.MoveError, match="calibrated to slot 3 \\('G'\\) instead of slot 1"):
+        await efw.calibrate()
+    assert efw.comm.get_own_state(IFilters).filter == "G"
+    assert efw.motion_status() == MotionStatus.ERROR
+    dev.settled_slot_override = None
 
     # ZwoError / TimeoutError -> ERROR + MoveError
     for raw_err in (

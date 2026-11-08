@@ -115,10 +115,11 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, ITemper
             FocuserState(focus=self._step_to_focus(step), focus_offset=self._focus_offset),
         )
 
-    async def _publish_status(self, status: EafStatus) -> EafStatus:
+    async def _publish_status(self, status: EafStatus, *, preserve_error: bool = False) -> EafStatus:
         """Publish `IMotion`, `IReady`, `IFocuser`, and `ITemperatures` states for `status`."""
-        motion_status = MotionStatus.SLEWING if status.moving else MotionStatus.POSITIONED
-        await self._change_motion_status(motion_status, interface=self.MOTION_INTERFACE)
+        if not (preserve_error and self.motion_status() == MotionStatus.ERROR and not status.moving):
+            motion_status = MotionStatus.SLEWING if status.moving else MotionStatus.POSITIONED
+            await self._change_motion_status(motion_status, interface=self.MOTION_INTERFACE)
         await self.comm.set_state(
             IFocuser,
             FocuserState(focus=self._step_to_focus(status.step), focus_offset=self._focus_offset),
@@ -163,11 +164,14 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, ITemper
             if device is None:
                 continue
             try:
-                await self._refresh_state(device)
+                status = await device.get_status()
             except ZwoError as err:
                 log.warning("Failed to poll EAF status: %s", err)
+                await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
+                continue
+            await self._publish_status(status, preserve_error=True)
 
-    async def _move_to_total_mm(self, total_mm: float) -> None:
+    async def _move_to_total_mm(self, total_mm: float, *, focus_offset: float | None = None) -> None:
         """Move the focuser to `total_mm` (`focus + focus_offset`) in millimeters."""
         device = self._require_device()
         target_step = round(total_mm / self._step_size)
@@ -201,6 +205,8 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, ITemper
             await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
             raise exc.MoveError(f"Focuser settled at step {settled_step} instead of target step {target_step}")
 
+        if focus_offset is not None:
+            self._focus_offset = focus_offset
         await self._publish_settled_step(settled_step)
         log.info("Focuser positioned at %.4f mm (step %d).", total_mm, settled_step)
 
@@ -259,8 +265,7 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, ITemper
                 f"outside allowed range [0, {status.max_step}]"
             )
 
-        self._focus_offset = offset
-        await self._move_to_total_mm(target_total_mm)
+        await self._move_to_total_mm(target_total_mm, focus_offset=offset)
 
     async def stop_motion(self, device: str | None = None, **kwargs: Any) -> None:
         """Stop focuser motion and publish the settled position.

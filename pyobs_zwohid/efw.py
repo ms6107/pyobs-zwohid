@@ -150,9 +150,16 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, ICalibra
             await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
             raise exc.MoveError(f"Failed to move filter wheel to {filter_name!r} (slot {target_slot}): {err}") from err
 
-        settled_name = self._slot_to_filter[settled_slot]
-        await self._change_motion_status(MotionStatus.POSITIONED, interface=self.MOTION_INTERFACE)
+        settled_name = self._slot_to_filter.get(settled_slot, "")
         await self.comm.set_state(IFilters, FilterState(filter=settled_name))
+        if settled_slot != target_slot:
+            await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
+            raise exc.MoveError(
+                f"Filter wheel settled at slot {settled_slot} ({settled_name!r}) "
+                f"instead of target slot {target_slot} ({filter_name!r})"
+            )
+
+        await self._change_motion_status(MotionStatus.POSITIONED, interface=self.MOTION_INTERFACE)
         await self.comm.send_event(FilterChangedEvent(current=settled_name))
         log.info("Filter wheel positioned at %s (slot %d).", settled_name, settled_slot)
 
@@ -179,9 +186,13 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, ICalibra
             await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
             raise exc.MoveError(f"Failed to calibrate filter wheel: {err}") from err
 
-        settled_name = self._slot_to_filter[settled_slot]
-        await self._change_motion_status(MotionStatus.POSITIONED, interface=self.MOTION_INTERFACE)
+        settled_name = self._slot_to_filter.get(settled_slot, "")
         await self.comm.set_state(IFilters, FilterState(filter=settled_name))
+        if settled_slot != 1:
+            await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
+            raise exc.MoveError(f"Filter wheel calibrated to slot {settled_slot} ({settled_name!r}) instead of slot 1")
+
+        await self._change_motion_status(MotionStatus.POSITIONED, interface=self.MOTION_INTERFACE)
         await self.comm.send_event(FilterChangedEvent(current=settled_name))
         log.info("Filter wheel calibrated and positioned at %s (slot %d).", settled_name, settled_slot)
 
