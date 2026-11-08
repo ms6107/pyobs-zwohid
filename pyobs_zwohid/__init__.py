@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+from .efw import ZwoEfw
 from .hid import ZwoHidModule
 
 __all__ = [
+    "ZwoEfw",
     "ZwoHidModule",
 ]
