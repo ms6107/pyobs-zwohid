@@ -12,6 +12,10 @@ dependencies = [
     "pyzwohid>=0.2.1,<1",
 ]
 
+[project.urls]
+Repository = "https://github.com/ms6107/pyobs-zwohid"
+Issues = "https://github.com/ms6107/pyobs-zwohid/issues"
+
 [dependency-groups]
 dev = [
     "mypy>=1.14.0",
@@ -28,8 +32,7 @@ build-backend = "hatchling.build"
 packages = ["pyobs_zwohid"]
 
 [tool.uv.sources]
-pyobs-core = { path = "../pyobs-core", editable = true }
-pyzwohid = { path = "../pyzwo", editable = true }
+pyzwohid = { git = "https://github.com/ms6107/pyzwohid.git", branch = "main" }
 
 [tool.mypy]
 python_version = "3.11"
