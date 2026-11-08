@@ -12,7 +12,7 @@ import math
 from typing import Any
 
 from pyobs.events import FilterChangedEvent
-from pyobs.interfaces import FiltersCapabilities, FilterState, IFilters, IFitsHeaderBefore
+from pyobs.interfaces import FiltersCapabilities, FilterState, ICalibrate, IFilters, IFitsHeaderBefore
 from pyobs.mixins import FilterHeaderMixin
 from pyobs.modules import timeout
 from pyobs.utils import exceptions as exc
@@ -24,7 +24,7 @@ from .hid import ZwoHidModule
 log = logging.getLogger(__name__)
 
 
-class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHeaderBefore):
+class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, ICalibrate, IFitsHeaderBefore):
     """`pyobs` module for ZWO Electronic Filter Wheels (EFW)."""
 
     __module__ = "pyobs_zwohid"
@@ -38,6 +38,7 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHea
         filters: list[str] | None = None,
         unidirectional: bool = False,
         move_timeout: float = 30.0,
+        calibrate_timeout: float = 60.0,
         **kwargs: Any,
     ) -> None:
         """Initialize the ZWO EFW module.
@@ -51,14 +52,19 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHea
             unidirectional: If `True`, rotate forward-only (CW) on slot changes;
                 if `False` (default), use shortest-path bidirectional rotation.
             move_timeout: Maximum time in seconds to wait for a slot move to settle.
+            calibrate_timeout: Maximum time in seconds to wait for calibration or
+                power-on homing to settle.
             **kwargs: Additional keyword arguments forwarded to `ZwoHidModule`.
 
         Raises:
-            ValueError: If `move_timeout` is not finite and positive, or if `filters`
-                is empty, contains blank names, or contains duplicate names.
+            ValueError: If `move_timeout` or `calibrate_timeout` is not finite and
+                positive, or if `filters` is empty, contains blank names, or
+                contains duplicate names.
         """
         if not math.isfinite(move_timeout) or move_timeout <= 0:
             raise ValueError(f"move_timeout must be finite and > 0, got {move_timeout}")
+        if not math.isfinite(calibrate_timeout) or calibrate_timeout <= 0:
+            raise ValueError(f"calibrate_timeout must be finite and > 0, got {calibrate_timeout}")
         if filters is not None:
             if not filters:
                 raise ValueError("filters must not be empty when specified")
@@ -74,6 +80,7 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHea
         self._filter_to_slot: dict[str, int] = {}
         self._unidirectional = unidirectional
         self._move_timeout = move_timeout
+        self._calibrate_timeout = calibrate_timeout
 
     async def _publish_status(self, status: EfwStatus) -> EfwStatus:
         """Publish `IMotion`, `IReady`, and `IFilters` states for `status`."""
@@ -87,7 +94,7 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHea
         """Wait for power-on motion to settle, validate filter count, and publish capabilities/state."""
         status = await device.get_status()
         if status.moving:
-            status = await device._wait_until_settled(self._move_timeout, "open()")
+            status = await device._wait_until_settled(self._calibrate_timeout, "open()")
 
         if self._configured_filters is None:
             filters = tuple(str(slot) for slot in range(1, status.slot_count + 1))
@@ -148,6 +155,35 @@ class ZwoEfw(FilterHeaderMixin, ZwoHidModule[Efw, EfwStatus], IFilters, IFitsHea
         await self.comm.set_state(IFilters, FilterState(filter=settled_name))
         await self.comm.send_event(FilterChangedEvent(current=settled_name))
         log.info("Filter wheel positioned at %s (slot %d).", settled_name, settled_slot)
+
+    @timeout(120)
+    async def calibrate(self, **kwargs: Any) -> None:
+        """Run self-calibration on the filter wheel, homing it to slot 1.
+
+        Args:
+            **kwargs: Additional RPC keyword arguments.
+
+        Raises:
+            DeviceBusyError: If the filter wheel is already moving.
+            MoveError: If calibration fails or times out.
+        """
+        device = self._require_device()
+        log.info("Calibrating filter wheel...")
+        await self._change_motion_status(MotionStatus.INITIALIZING, interface=self.MOTION_INTERFACE)
+        try:
+            settled_slot = await device.calibrate(timeout=self._calibrate_timeout)
+        except ZwoBusyError as err:
+            await self._refresh_state(device)
+            raise exc.DeviceBusyError(str(err)) from err
+        except (ZwoError, TimeoutError) as err:
+            await self._change_motion_status(MotionStatus.ERROR, interface=self.MOTION_INTERFACE)
+            raise exc.MoveError(f"Failed to calibrate filter wheel: {err}") from err
+
+        settled_name = self._slot_to_filter[settled_slot]
+        await self._change_motion_status(MotionStatus.POSITIONED, interface=self.MOTION_INTERFACE)
+        await self.comm.set_state(IFilters, FilterState(filter=settled_name))
+        await self.comm.send_event(FilterChangedEvent(current=settled_name))
+        log.info("Filter wheel calibrated and positioned at %s (slot %d).", settled_name, settled_slot)
 
     async def stop_motion(self, device: str | None = None, **kwargs: Any) -> None:
         """Stop filter wheel motion (no-op; ZWO EFW protocol does not support aborting slot motion)."""

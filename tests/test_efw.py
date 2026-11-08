@@ -33,6 +33,8 @@ class FakeEfwDevice(FakeZwoHidDevice, Efw):
         self.pending_statuses: list[EfwStatus] = list(self.initial_statuses)
         self.move_to_slot_calls: list[tuple[int, bool, float]] = []
         self.move_to_slot_error: Exception | None = None
+        self.calibrate_calls: list[float] = []
+        self.calibrate_error: Exception | None = None
 
     @classmethod
     def reset_efw_fakes(
@@ -66,6 +68,15 @@ class FakeEfwDevice(FakeZwoHidDevice, Efw):
         self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=slot)
         return slot
 
+    async def calibrate(self, timeout: float = 60.0) -> int:
+        self.calibrate_calls.append(timeout)
+        if self.efw_status.moving:
+            raise ZwoBusyError("EFW is already moving")
+        if self.calibrate_error is not None:
+            raise self.calibrate_error
+        self.efw_status = EfwStatus(moving=False, slot_count=self.efw_status.slot_count, slot=1)
+        return 1
+
 
 class _TestableZwoEfw(ZwoEfw):
     """ZwoEfw wired to FakeEfwDevice and FakeComm for unit tests."""
@@ -77,10 +88,12 @@ class _TestableZwoEfw(ZwoEfw):
         super().__init__(*args, **kwargs)
 
 
-def test_init_validates_filters_and_move_timeout() -> None:
+def test_init_validates_filters_and_timeouts() -> None:
     for bad_timeout in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="move_timeout must be finite and > 0"):
             _TestableZwoEfw(move_timeout=bad_timeout)
+        with pytest.raises(ValueError, match="calibrate_timeout must be finite and > 0"):
+            _TestableZwoEfw(calibrate_timeout=bad_timeout)
 
     with pytest.raises(ValueError, match="filters must not be empty"):
         _TestableZwoEfw(filters=[])
@@ -166,7 +179,7 @@ async def test_open_times_out_if_power_on_motion_never_settles() -> None:
     FakeEfwDevice.reset_efw_fakes(
         initial_statuses=[EfwStatus(moving=True, slot_count=-1, slot=-1)],
     )
-    efw = _TestableZwoEfw(move_timeout=0.02)
+    efw = _TestableZwoEfw(calibrate_timeout=0.02)
     with pytest.raises(TimeoutError, match="open\\(\\) timed out"):
         await efw.open()
 
@@ -230,5 +243,48 @@ async def test_set_filter_error_paths() -> None:
             await efw.set_filter("B")
         assert efw.motion_status() == MotionStatus.ERROR
         assert efw.comm.get_own_state(IMotion).status == MotionStatus.ERROR
+
+    await efw.close()
+
+
+@pytest.mark.asyncio
+async def test_calibrate_homes_wheel_to_slot_one_and_handles_errors() -> None:
+    FakeEfwDevice.reset_efw_fakes(
+        initial_statuses=[EfwStatus(moving=False, slot_count=5, slot=4)],
+    )
+    comm = FakeComm()
+    efw = _TestableZwoEfw(
+        filters=["L", "R", "G", "B", "Ha"],
+        calibrate_timeout=45.0,
+        comm=comm,
+    )
+    await efw.open()
+    dev = FakeEfwDevice.instances[0]
+    comm.events.clear()
+
+    await efw.calibrate()
+    assert dev.calibrate_calls == [45.0]
+    assert efw.comm.get_own_state(IFilters).filter == "L"
+    assert efw.motion_status() == MotionStatus.POSITIONED
+    filter_events = [e for e in comm.events if isinstance(e, FilterChangedEvent)]
+    assert len(filter_events) == 1
+    assert filter_events[0].filter == "L"
+
+    # Busy -> DeviceBusyError
+    dev.efw_status = EfwStatus(moving=True, slot_count=5, slot=-1)
+    with pytest.raises(exc.DeviceBusyError, match="EFW is already moving"):
+        await efw.calibrate()
+    assert efw.motion_status() == MotionStatus.SLEWING
+    dev.efw_status = EfwStatus(moving=False, slot_count=5, slot=1)
+
+    # ZwoError / TimeoutError -> ERROR + MoveError
+    for raw_err in (
+        ZwoError(f"EFW calibration fault on {DEV_PATH}"),
+        TimeoutError("calibrate() timed out after 45.00s"),
+    ):
+        dev.calibrate_error = raw_err
+        with pytest.raises(exc.MoveError, match="Failed to calibrate filter wheel"):
+            await efw.calibrate()
+        assert efw.motion_status() == MotionStatus.ERROR
 
     await efw.close()
