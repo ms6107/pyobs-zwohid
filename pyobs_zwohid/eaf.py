@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from typing import Annotated, Any
 
-from pyobs.interfaces import FocuserState, IFitsHeaderBefore, IFocuser
+from pyobs.interfaces import FocuserState, IFitsHeaderBefore, IFocuser, ITemperatures, SensorReading, TemperaturesState
 from pyobs.mixins import FocuserHeaderMixin
 from pyobs.modules import timeout
 from pyobs.utils import exceptions as exc
@@ -23,7 +24,7 @@ from .hid import ZwoHidModule
 log = logging.getLogger(__name__)
 
 
-class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHeaderBefore):
+class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, ITemperatures, IFitsHeaderBefore):
     """`pyobs` module for ZWO Electronic Automatic Focusers (EAF)."""
 
     __module__ = "pyobs_zwohid"
@@ -37,6 +38,7 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         step_size: float = 0.001,
         move_timeout: float = 60.0,
         stop_timeout: float = 5.0,
+        poll_interval: float = 10.0,
         max_step: int | None = None,
         backlash: int | None = None,
         reverse: bool | None = None,
@@ -53,6 +55,8 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
                 Defaults to `0.001` (`1 µm/step`).
             move_timeout: Maximum time in seconds to wait for a focus move to settle.
             stop_timeout: Maximum time in seconds to wait for `stop_motion()` to settle.
+            poll_interval: Interval in seconds between background status and
+                temperature polls.
             max_step: Optional maximum step limit (`>= 1`). If `None`, keeps the
                 focuser's current `max_step`.
             backlash: Optional backlash compensation in steps (`0..255`). If `None`,
@@ -66,9 +70,9 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
             **kwargs: Additional keyword arguments forwarded to `ZwoHidModule`.
 
         Raises:
-            ValueError: If `step_size`, `move_timeout`, or `stop_timeout` is not
-                finite and positive, or if `max_step`, `backlash`, or `max_force` is
-                outside its valid domain.
+            ValueError: If `step_size`, `move_timeout`, `stop_timeout`, or
+                `poll_interval` is not finite and positive, or if `max_step`,
+                `backlash`, or `max_force` is outside its valid domain.
         """
         if not math.isfinite(step_size) or step_size <= 0:
             raise ValueError(f"step_size must be finite and > 0, got {step_size}")
@@ -76,6 +80,8 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
             raise ValueError(f"move_timeout must be finite and > 0, got {move_timeout}")
         if not math.isfinite(stop_timeout) or stop_timeout <= 0:
             raise ValueError(f"stop_timeout must be finite and > 0, got {stop_timeout}")
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError(f"poll_interval must be finite and > 0, got {poll_interval}")
         if max_step is not None and max_step < 1:
             raise ValueError(f"max_step must be >= 1, got {max_step}")
         if backlash is not None and not (0 <= backlash <= 255):
@@ -87,6 +93,7 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         self._step_size = step_size
         self._move_timeout = move_timeout
         self._stop_timeout = stop_timeout
+        self._poll_interval = poll_interval
         self._max_step = max_step
         self._backlash = backlash
         self._reverse = reverse
@@ -94,6 +101,7 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         self._max_force = max_force
         self._focus_offset = 0.0
         self._aborted = False
+        self.add_background_task(self._poll_status)
 
     def _step_to_focus(self, step: int) -> float:
         """Convert hardware `step` to base focus in millimeters (`step * step_size - focus_offset`)."""
@@ -108,13 +116,15 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         )
 
     async def _publish_status(self, status: EafStatus) -> EafStatus:
-        """Publish `IMotion`, `IReady`, and `IFocuser` states for `status`."""
+        """Publish `IMotion`, `IReady`, `IFocuser`, and `ITemperatures` states for `status`."""
         motion_status = MotionStatus.SLEWING if status.moving else MotionStatus.POSITIONED
         await self._change_motion_status(motion_status, interface=self.MOTION_INTERFACE)
         await self.comm.set_state(
             IFocuser,
             FocuserState(focus=self._step_to_focus(status.step), focus_offset=self._focus_offset),
         )
+        readings = [SensorReading(name="Focus", value=status.temperature_c)] if status.temperature_c is not None else []
+        await self.comm.set_state(ITemperatures, TemperaturesState(readings=readings))
         return status
 
     def _needs_configuration(self, status: EafStatus) -> bool:
@@ -142,8 +152,20 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         await self._publish_status(status)
 
     async def _refresh_state(self, device: Eaf) -> EafStatus:
-        """Query `device.get_status()` and publish updated motion and focuser states."""
+        """Query `device.get_status()` and publish updated motion, focuser, and temperature states."""
         return await self._publish_status(await device.get_status())
+
+    async def _poll_status(self) -> None:
+        """Periodically poll and publish focuser status and temperature."""
+        while True:
+            await asyncio.sleep(self._poll_interval)
+            device = self._device
+            if device is None:
+                continue
+            try:
+                await self._refresh_state(device)
+            except ZwoError as err:
+                log.warning("Failed to poll EAF status: %s", err)
 
     async def _move_to_total_mm(self, total_mm: float) -> None:
         """Move the focuser to `total_mm` (`focus + focus_offset`) in millimeters."""

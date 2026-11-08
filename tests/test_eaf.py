@@ -12,7 +12,16 @@ from dataclasses import replace
 from typing import Any, ClassVar
 
 import pytest
-from pyobs.interfaces import FitsHeaderEntry, FocuserState, IFocuser, IMotion, IReady
+from pyobs.interfaces import (
+    FitsHeaderEntry,
+    FocuserState,
+    IFocuser,
+    IMotion,
+    IReady,
+    ITemperatures,
+    SensorReading,
+    TemperaturesState,
+)
 from pyobs.utils import exceptions as exc
 from pyobs.utils.enums import MotionStatus
 from pyzwohid import Eaf, EafStatus, ZwoBusyError, ZwoError
@@ -163,6 +172,8 @@ def test_init_validates_parameters() -> None:
             _TestableZwoEaf(move_timeout=bad_val)
         with pytest.raises(ValueError, match="stop_timeout must be finite and > 0"):
             _TestableZwoEaf(stop_timeout=bad_val)
+        with pytest.raises(ValueError, match="poll_interval must be finite and > 0"):
+            _TestableZwoEaf(poll_interval=bad_val)
 
     for bad_max_step in (0, -5):
         with pytest.raises(ValueError, match="max_step must be >= 1"):
@@ -176,8 +187,8 @@ def test_init_validates_parameters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_publishes_focuser_state_and_fits_headers() -> None:
-    FakeEafDevice.reset_eaf_fakes(initial_status=_eaf_status(step=25_000, max_step=60_000))
+async def test_open_publishes_focuser_temperature_and_fits_headers() -> None:
+    FakeEafDevice.reset_eaf_fakes(initial_status=_eaf_status(step=25_000, max_step=60_000, temperature_c=19.25))
     eaf = _TestableZwoEaf(step_size=0.002)
     await eaf.open()
 
@@ -186,6 +197,9 @@ async def test_open_publishes_focuser_state_and_fits_headers() -> None:
     assert isinstance(state, FocuserState)
     assert state.focus == pytest.approx(50.0)
     assert state.focus_offset == pytest.approx(0.0)
+    temp_state = eaf.comm.get_own_state(ITemperatures)
+    assert isinstance(temp_state, TemperaturesState)
+    assert temp_state.readings == [SensorReading(name="Focus", value=19.25)]
     assert eaf.motion_status() == MotionStatus.POSITIONED
     assert eaf.comm.get_own_state(IReady).ready is True
     assert eaf.comm.missing_published_state(eaf.interfaces) == []
@@ -374,5 +388,34 @@ async def test_set_focus_and_offset_error_paths() -> None:
     with pytest.raises(exc.MoveError, match="Failed to read focuser status"):
         await eaf.set_focus_offset(1.0)
     assert eaf.motion_status() == MotionStatus.ERROR
+
+    await eaf.close()
+
+
+@pytest.mark.asyncio
+async def test_background_poll_updates_temperature_and_position() -> None:
+    FakeEafDevice.reset_eaf_fakes(initial_status=_eaf_status(step=10_000, temperature_c=None))
+    eaf = _TestableZwoEaf(step_size=0.001, poll_interval=0.01)
+    await eaf.open()
+    dev = FakeEafDevice.instances[0]
+
+    assert eaf.comm.get_own_state(ITemperatures).readings == []
+
+    # Simulate external/hand-controller motion and new temperature reading
+    dev.eaf_status = _eaf_status(moving=True, step=12_345, temperature_c=18.75, hand_controller_active=True)
+    await asyncio.sleep(0.03)
+    assert eaf.motion_status() == MotionStatus.SLEWING
+    assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(12.345)
+    assert eaf.comm.get_own_state(ITemperatures).readings == [SensorReading(name="Focus", value=18.75)]
+
+    # Simulate hand-controller button release and transient status error survival
+    dev.status_error = ZwoError("Transient read glitch")
+    await asyncio.sleep(0.02)
+    dev.status_error = None
+    dev.eaf_status = _eaf_status(moving=False, step=15_000, temperature_c=18.5)
+    await asyncio.sleep(0.03)
+    assert eaf.motion_status() == MotionStatus.POSITIONED
+    assert eaf.comm.get_own_state(IFocuser).focus == pytest.approx(15.0)
+    assert eaf.comm.get_own_state(ITemperatures).readings == [SensorReading(name="Focus", value=18.5)]
 
     await eaf.close()

@@ -93,12 +93,16 @@ class ZwoHidModule(Module, MotionStatusMixin, Generic[_DeviceT, _StatusT]):
         """
         await Module.open(self)
         await MotionStatusMixin.open(self)
-
-        device = await self._open_device()
         try:
-            await self._setup_device(device)
+            device = await self._open_device()
+            try:
+                await self._setup_device(device)
+            except BaseException:
+                await device.close()
+                raise
         except BaseException:
-            await device.close()
+            self._stop_background_tasks()
+            self._opened = False
             raise
         self._device = device
 
