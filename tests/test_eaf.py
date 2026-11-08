@@ -66,6 +66,8 @@ class FakeEafDevice(FakeZwoHidDevice, Eaf):
         self.stop_calls: list[float] = []
         self.stop_error: Exception | None = None
         self.stopped_step: int = 25_000
+        self.configure_calls: list[dict[str, Any]] = []
+        self.configure_error: Exception | None = None
 
     @classmethod
     def reset_eaf_fakes(
@@ -111,6 +113,37 @@ class FakeEafDevice(FakeZwoHidDevice, Eaf):
         self.eaf_status = replace(self.eaf_status, moving=False)
         return self.eaf_status.step
 
+    async def configure(
+        self,
+        *,
+        max_step: int | None = None,
+        backlash: int | None = None,
+        reverse: bool | None = None,
+        beep: bool | None = None,
+        max_force: int | None = None,
+    ) -> None:
+        self.configure_calls.append(
+            {
+                "max_step": max_step,
+                "backlash": backlash,
+                "reverse": reverse,
+                "beep": beep,
+                "max_force": max_force,
+            }
+        )
+        if self.configure_error is not None:
+            raise self.configure_error
+        if max_step is not None and max_step < self.eaf_status.step:
+            raise ValueError(f"max_step={max_step} cannot be less than current step={self.eaf_status.step}")
+        self.eaf_status = replace(
+            self.eaf_status,
+            max_step=self.eaf_status.max_step if max_step is None else max_step,
+            backlash=self.eaf_status.backlash if backlash is None else backlash,
+            reverse=self.eaf_status.reverse if reverse is None else reverse,
+            beep=self.eaf_status.beep if beep is None else beep,
+            max_force=self.eaf_status.max_force if max_force is None else max_force,
+        )
+
 
 class _TestableZwoEaf(ZwoEaf):
     """ZwoEaf wired to FakeEafDevice and FakeComm for unit tests."""
@@ -131,6 +164,16 @@ def test_init_validates_parameters() -> None:
         with pytest.raises(ValueError, match="stop_timeout must be finite and > 0"):
             _TestableZwoEaf(stop_timeout=bad_val)
 
+    for bad_max_step in (0, -5):
+        with pytest.raises(ValueError, match="max_step must be >= 1"):
+            _TestableZwoEaf(max_step=bad_max_step)
+    for bad_backlash in (-1, 256):
+        with pytest.raises(ValueError, match="backlash must be in \\[0, 255\\]"):
+            _TestableZwoEaf(backlash=bad_backlash)
+    for bad_force in (0, 6, -1):
+        with pytest.raises(ValueError, match="max_force must be in \\[1, 5\\]"):
+            _TestableZwoEaf(max_force=bad_force)
+
 
 @pytest.mark.asyncio
 async def test_open_publishes_focuser_state_and_fits_headers() -> None:
@@ -138,6 +181,7 @@ async def test_open_publishes_focuser_state_and_fits_headers() -> None:
     eaf = _TestableZwoEaf(step_size=0.002)
     await eaf.open()
 
+    assert FakeEafDevice.instances[0].configure_calls == []
     state = eaf.comm.get_own_state(IFocuser)
     assert isinstance(state, FocuserState)
     assert state.focus == pytest.approx(50.0)
@@ -153,6 +197,66 @@ async def test_open_publishes_focuser_state_and_fits_headers() -> None:
     }
 
     await eaf.close()
+
+
+@pytest.mark.asyncio
+async def test_open_configures_hardware_only_when_settings_differ() -> None:
+    initial = _eaf_status(
+        step=20_000,
+        max_step=60_000,
+        backlash=10,
+        reverse=False,
+        beep=False,
+        max_force=3,
+    )
+
+    # 1. All specified settings match hardware -> no configure() call
+    FakeEafDevice.reset_eaf_fakes(initial_status=initial)
+    eaf_same = _TestableZwoEaf(
+        max_step=60_000,
+        backlash=10,
+        reverse=False,
+        beep=False,
+        max_force=3,
+    )
+    await eaf_same.open()
+    assert FakeEafDevice.instances[0].configure_calls == []
+    await eaf_same.close()
+
+    # 2. Differing settings -> single configure() call
+    FakeEafDevice.reset_eaf_fakes(initial_status=initial)
+    eaf_diff = _TestableZwoEaf(
+        max_step=50_000,
+        backlash=25,
+        reverse=True,
+        beep=True,
+        max_force=4,
+    )
+    await eaf_diff.open()
+    dev = FakeEafDevice.instances[0]
+    assert dev.configure_calls == [
+        {
+            "max_step": 50_000,
+            "backlash": 25,
+            "reverse": True,
+            "beep": True,
+            "max_force": 4,
+        }
+    ]
+    assert dev.eaf_status.max_step == 50_000
+    assert dev.eaf_status.backlash == 25
+    assert dev.eaf_status.reverse is True
+    assert dev.eaf_status.beep is True
+    assert dev.eaf_status.max_force == 4
+    await eaf_diff.close()
+
+    # 3. Invalid max_step < current step during open() -> closes handle and propagates ValueError
+    FakeEafDevice.reset_eaf_fakes(initial_status=initial)
+    eaf_bad = _TestableZwoEaf(max_step=10_000)
+    with pytest.raises(ValueError, match="max_step=10000 cannot be less than current step=20000"):
+        await eaf_bad.open()
+    assert FakeEafDevice.instances[0].closed
+    await eaf_bad.close()
 
 
 @pytest.mark.asyncio

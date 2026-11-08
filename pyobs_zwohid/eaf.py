@@ -37,6 +37,11 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         step_size: float = 0.001,
         move_timeout: float = 60.0,
         stop_timeout: float = 5.0,
+        max_step: int | None = None,
+        backlash: int | None = None,
+        reverse: bool | None = None,
+        beep: bool | None = None,
+        max_force: int | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the ZWO EAF focuser module.
@@ -48,11 +53,22 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
                 Defaults to `0.001` (`1 µm/step`).
             move_timeout: Maximum time in seconds to wait for a focus move to settle.
             stop_timeout: Maximum time in seconds to wait for `stop_motion()` to settle.
+            max_step: Optional maximum step limit (`>= 1`). If `None`, keeps the
+                focuser's current `max_step`.
+            backlash: Optional backlash compensation in steps (`0..255`). If `None`,
+                keeps the focuser's current `backlash`.
+            reverse: Optional motor direction reversal flag. If `None`, keeps the
+                focuser's current direction.
+            beep: Optional motion buzzer flag. If `None`, keeps the focuser's
+                current buzzer setting.
+            max_force: Optional motor torque / holding force level (`1..5`). If `None`,
+                keeps the focuser's current `max_force`.
             **kwargs: Additional keyword arguments forwarded to `ZwoHidModule`.
 
         Raises:
             ValueError: If `step_size`, `move_timeout`, or `stop_timeout` is not
-                finite and positive.
+                finite and positive, or if `max_step`, `backlash`, or `max_force` is
+                outside its valid domain.
         """
         if not math.isfinite(step_size) or step_size <= 0:
             raise ValueError(f"step_size must be finite and > 0, got {step_size}")
@@ -60,11 +76,22 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
             raise ValueError(f"move_timeout must be finite and > 0, got {move_timeout}")
         if not math.isfinite(stop_timeout) or stop_timeout <= 0:
             raise ValueError(f"stop_timeout must be finite and > 0, got {stop_timeout}")
+        if max_step is not None and max_step < 1:
+            raise ValueError(f"max_step must be >= 1, got {max_step}")
+        if backlash is not None and not (0 <= backlash <= 255):
+            raise ValueError(f"backlash must be in [0, 255], got {backlash}")
+        if max_force is not None and not (1 <= max_force <= 5):
+            raise ValueError(f"max_force must be in [1, 5], got {max_force}")
 
         super().__init__(path=path, **kwargs)
         self._step_size = step_size
         self._move_timeout = move_timeout
         self._stop_timeout = stop_timeout
+        self._max_step = max_step
+        self._backlash = backlash
+        self._reverse = reverse
+        self._beep = beep
+        self._max_force = max_force
         self._focus_offset = 0.0
         self._aborted = False
 
@@ -90,9 +117,28 @@ class ZwoEaf(FocuserHeaderMixin, ZwoHidModule[Eaf, EafStatus], IFocuser, IFitsHe
         )
         return status
 
+    def _needs_configuration(self, status: EafStatus) -> bool:
+        """Return `True` if any configured hardware parameter differs from `status`."""
+        return (
+            (self._max_step is not None and status.max_step != self._max_step)
+            or (self._backlash is not None and status.backlash != self._backlash)
+            or (self._reverse is not None and status.reverse != self._reverse)
+            or (self._beep is not None and status.beep != self._beep)
+            or (self._max_force is not None and status.max_force != self._max_force)
+        )
+
     async def _setup_device(self, device: Eaf) -> None:
-        """Read initial status from the EAF and publish initial states."""
+        """Read initial status from the EAF, apply differing hardware settings, and publish states."""
         status = await device.get_status()
+        if self._needs_configuration(status):
+            await device.configure(
+                max_step=self._max_step,
+                backlash=self._backlash,
+                reverse=self._reverse,
+                beep=self._beep,
+                max_force=self._max_force,
+            )
+            status = await device.get_status()
         await self._publish_status(status)
 
     async def _refresh_state(self, device: Eaf) -> EafStatus:
